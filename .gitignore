@@ -19,6 +19,7 @@ _cgo_export.*
 
 _testmain.go
 
+HTTPReJect
 *.exe
 *.test
 *.prof
