@@ -262,21 +262,11 @@ Here's the tl;dr guide to building:
 * setup GOPATH:             
     >export GOPATH=$HOME/Go
 
-* get the dependencies:
-
-    > go get github.com/golang/glog
-    >
-    > go get github.com/google/gopacket
-    >
-    > go get github.com/google/gopacket/layers
-    >
-    > go get github.com/google/gopacket/pcap
-    >
-    > go get github.com/google/gopacket/tcpassembly
-    >
-    >go get github.com/google/gopacket/tcpassembly/tcpreader
+* get the code & dependencies:
+    > go get github.com/taboola/HTTPReJect github.com/golang/glog github.com/google/gopacket
    
 * build it:                
-    > go build`
+    > go build github.com/taboola/HTTPReJect
 
 * that's it!
+    > ./HTTPReJect --help
