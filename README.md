@@ -270,3 +270,17 @@ Here's the tl;dr guide to building:
 
 * that's it!
     > ./HTTPReJect --help
+
+## Windows
+Perform these steps, then proceed with the tl;dr version, replacing export with the windows-equivalent of set.
+ 
+ * Download winpcap developer version
+    > https://www.winpcap.org/install/bin/WpdPack_4_1_2.zip
+ 
+ * Since winpcap dev is 32-bit only, we must set GOARCH accordingly
+    > set GOARCH=386
+    
+ * Enable CGO
+    > set CGO_ENABLED=1
+    
+ * Ready to go!
