@@ -239,10 +239,13 @@ const (
 	Error    RunnerType = iota
 )
 
+//unixNano and lastUnixNano fields must be placed on top of the struct,
+//since their addresses must be 8-byte aligned.
+//see https://github.com/golang/go/issues/5278 for further information.
 type readerAndTime struct {
-	tcpreader.ReaderStream
 	unixNano       int64
 	lastUnixNano   int64
+	tcpreader.ReaderStream
 	pcapStreamSide chan RunnerType
 	started        bool
 	key            *netKey
