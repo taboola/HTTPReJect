@@ -26,11 +26,9 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"runtime"
 	"sync"
@@ -85,7 +83,7 @@ var numLateDropped uint64 = 0
 var numPcapReqErrs uint64 = 0
 var numPcapRespErrs uint64 = 0
 var numBadStreams uint64 = 0
-
+var rep reporter
 // Global to get packet info in httpStreamFactory New:
 var curPacket *gopacket.Packet
 
@@ -138,48 +136,6 @@ var roundTripTransport = &http.Transport{
 	DisableKeepAlives:   true,
 }
 
-type stat struct {
-	reqinfo
-	pcapRespinfo
-	RTT       float64  // Round Trip Time
-	RC        int      // Return Code
-	RespLen   int      // Response length
-	respMatch []string // matching captures from the response
-}
-
-func (this *stat) String() string {
-
-	var extraParms string
-	if this.getParms == nil || len(this.getParms) == 0 {
-		extraParms = ""
-	} else {
-		var buffer bytes.Buffer
-		for _, parm := range this.getParms {
-			buffer.WriteByte(',')
-			buffer.WriteString(parm)
-		}
-
-		extraParms = buffer.String()
-	}
-
-	var respMatches string
-	if this.respMatch == nil || len(this.respMatch) == 0 {
-		respMatches = ""
-	} else {
-		var buffer bytes.Buffer
-		for _, match := range this.respMatch {
-			buffer.WriteByte(',')
-			buffer.WriteString(match)
-		}
-
-		respMatches = buffer.String()
-	}
-
-	return fmt.Sprintf("%v,%s,%03d,%f,%d,%d,%f,%d,%d,%d,%03d,%f,%f%s%s",
-		time.Unix(0, this.TS), this.URL, this.RC, this.RTT, this.ReqLen, this.RespLen, this.TimeAccuracy, this.streamNum,
-		this.reqNum, this.OrigRlen, this.OrigRC, this.OrigRTT, this.wallDiff, extraParms, respMatches)
-}
-
 type reqinfo struct {
 	URL          string
 	TS           int64    // Nanos since epoch filetime
@@ -204,10 +160,6 @@ func (this *reqinfo) String() string {
 	return fmt.Sprintf("%v,%s,%d,%f",
 		this.TS, this.URL, this.ReqLen, this.TimeAccuracy)
 }
-
-var statRepChan chan *stat
-var pcapRespRepChan chan *pcapRespinfo
-var droppedRepChan chan *reqinfo
 
 // netKey is used to map bidirectional streams to each other, mapping the http reqs from the pcap to the http resp.
 // taken from: https://github.com/google/gopacket/blob/master/examples/bidirectional/main.go
@@ -517,7 +469,7 @@ func (this *httpStream) proxyRequest(req *http.Request, reqlen int, filetime int
 
 				atomic.AddUint64(&numLateDropped, 1)
 
-				droppedRepChan <- &reqinfo{
+				droppedRequestStats := &reqinfo{
 					URL:          req.URL.Path,
 					TS:           fileTimeAfterReqBody,
 					ReqLen:       reqlen,
@@ -525,6 +477,7 @@ func (this *httpStream) proxyRequest(req *http.Request, reqlen int, filetime int
 					streamNum:    streamnum,
 					reqNum:       numreqs,
 				}
+				rep.ReportDropped(droppedRequestStats)
 
 				// Don't forget to clear the inflight.  Can't defer it as it needs to be done before pending on the pcap result
 				<-inflightChan
@@ -592,7 +545,7 @@ func (this *httpStream) proxyRequest(req *http.Request, reqlen int, filetime int
 
 			if respError != io.EOF {
 				glog.Warningf("WARNING: got error reading response for req : %v.  Error : %v\n", req, respError)
-				statRepChan <- nil
+				rep.ReportFailedStat()
 
 				return
 			}
@@ -630,7 +583,7 @@ func (this *httpStream) proxyRequest(req *http.Request, reqlen int, filetime int
 		}
 
 		//  Report back stats:
-		statRepChan <- &stat{
+		reportStat := &stat{
 			reqinfo: reqinfo{
 				URL:          urlString,
 				TS:           filetime,
@@ -646,13 +599,14 @@ func (this *httpStream) proxyRequest(req *http.Request, reqlen int, filetime int
 			RC:        rc,
 			respMatch: respCaps,
 		}
+		rep.ReportStat(reportStat)
 
 	} else {
 		glog.Warningf("WARNING: got error sending request : %s : %v\n", req.URL.String(), err)
 		if resp != nil && resp.Body != nil {
 			resp.Body.Close()
 		}
-		statRepChan <- nil
+		rep.ReportFailedStat()
 	}
 
 }
@@ -832,13 +786,14 @@ func (this *httpStream) respRun(streamNum uint64, counter *uint64) {
 
 			glog.V(2).Infof("respRun: read :%d bytes from streamnum: %d. ft: %v", len(bodyBytes), streamNum, time.Unix(0, latestPcapTime))
 
-			pcapRespRepChan <- &pcapRespinfo{
+			responseStat := &pcapRespinfo{
 				Resptime:      latestPcapTime,
 				OrigRC:        resp.StatusCode,
 				OrigRlen:      len(bodyBytes),
 				respStreamNum: streamNum,
 				respNum:       numresps,
 			}
+			rep.ReportResponse(responseStat)
 
 		}
 	}
@@ -876,217 +831,6 @@ func (this *httpStream) run(streamNum uint64, counter *uint64) {
 			glog.V(1).Infof("Unmatched response encountered %v:%v.  Throwing Away.",
 				this.rat.key.net, this.rat.key.transport)
 			this.ignoreAndThrowAway()
-		}
-	}
-}
-
-var rtts = make([]float64, 0, 10000000) // 10 million initial length
-
-// log the stat if logging is enabled.  Also keep track of failed results
-func handleStat(someStat *stat, logStats bool, statLog *log.Logger, stated int, failed int) (int, int) {
-	if someStat != nil {
-		rtts = append(rtts, someStat.RTT)
-		stated++
-
-		if logStats {
-			statLog.Println(someStat.String())
-		}
-	} else {
-		failed++
-	}
-
-	return stated, failed
-}
-
-// goroutine to handle reporting from proxy goroutines
-func reporting(done chan bool) {
-
-	logStats := false
-	var statfile *os.File
-	if *statOutfile != "" {
-		logStats = true
-
-		var err error
-		if statfile, err = os.Create(*statOutfile); err != nil {
-			glog.Fatalf("Failed to open stat output file %s : %v\n", *statOutfile, err)
-		}
-	}
-	statLog := log.New(statfile, "", 0)
-
-	logDropped := false
-	var droppedfile *os.File
-	if *droppedOutfile != "" {
-		logDropped = true
-
-		var err error
-		if droppedfile, err = os.Create(*droppedOutfile); err != nil {
-			glog.Fatalf("Failed to open dropped output file %s : %v\n", *droppedOutfile, err)
-		}
-	}
-	droppedLog := log.New(droppedfile, "", 0)
-
-	tensecs := time.Tick(time.Second * 10)
-
-	stated := 0
-	failed := 0
-	dropped := 0
-	lastStated := 0
-	numMismatchedRCs := 0
-
-	lastTime := time.Now()
-	finishingUp := false
-	for {
-		select {
-		case someStat := <-statRepChan:
-			if *readResponse && someStat != nil {
-				// do we have the other side?
-				key := streamKey{someStat.streamNum, someStat.reqNum}
-				if presp, is := streamRespSeqMap[key]; is {
-					delete(streamRespSeqMap, key)
-
-					presp.OrigRTT = float64(presp.Resptime-someStat.TS) / float64(time.Second)
-					someStat.pcapRespinfo = *presp
-					stated, failed = handleStat(someStat, logStats, statLog, stated, failed)
-					if someStat.OrigRC != someStat.RC {
-						numMismatchedRCs++
-					}
-				} else {
-					streamReqSeqMap[key] = someStat
-				}
-			} else {
-				stated, failed = handleStat(someStat, logStats, statLog, stated, failed)
-			}
-
-		case someDrop := <-droppedRepChan:
-			dropped++
-			if logDropped {
-				droppedLog.Println(someDrop.String())
-			}
-
-		case somePcapResp := <-pcapRespRepChan:
-			// do we have the other side?
-			if somePcapResp != nil {
-				key := streamKey{somePcapResp.respStreamNum, somePcapResp.respNum}
-				if reqstat, is := streamReqSeqMap[key]; is {
-					delete(streamReqSeqMap, key)
-					somePcapResp.OrigRTT = float64(somePcapResp.Resptime-reqstat.TS) / float64(time.Second)
-					reqstat.pcapRespinfo = *somePcapResp
-					stated, failed = handleStat(reqstat, logStats, statLog, stated, failed)
-					if reqstat.OrigRC != reqstat.RC {
-						numMismatchedRCs++
-					}
-				} else {
-					streamRespSeqMap[key] = somePcapResp
-				}
-			}
-
-		case <-tensecs:
-			diffStated := stated - lastStated
-			lastStated = stated
-
-			now := time.Now()
-			rate := float64(diffStated) / now.Sub(lastTime).Seconds()
-			lastTime = now
-
-			var repstate string
-			if finishingUp {
-				repstate = "Finishing Up"
-			} else {
-				repstate = "Still Running"
-			}
-
-			glog.Infof("%s: rate : %f  Reported : %d  Failed : %d.  Flawed : %d.  reqs : %d, proxySent : %d, sleeping : %d, inFlight : %d, lateDropped : %d\n",
-				repstate,
-				rate,
-				stated,
-				failed,
-				atomic.LoadUint64(&numBadStreams),
-				atomic.LoadUint64(&totNumReqs),
-				atomic.LoadUint64(&numProxySent),
-				atomic.LoadUint64(&numProxySleeping),
-				atomic.LoadUint64(&numProxyInFlight),
-				atomic.LoadUint64(&numLateDropped))
-
-		case <-done:
-			// This is a little ugly, but we need to still process anything left in the statRepChan, but we can't
-			// pend on the chan:
-			finishingUp = true
-
-		default:
-			if finishingUp {
-				glog.Infof("Done reporting.  Stated : %d  Failed : %d.  Flawed : %d.  Unmatched reqs: %d.  Unmatched resps: %d.  Pcap req errs : %d, Pcap resp errs : %d\n",
-					stated,
-					failed,
-					atomic.LoadUint64(&numBadStreams),
-					len(streamReqSeqMap),
-					len(streamRespSeqMap),
-					atomic.LoadUint64(&numPcapReqErrs),
-					atomic.LoadUint64(&numPcapRespErrs))
-
-				if len(streamReqSeqMap) > 0 {
-					// Go through all unmatched reqs and log them without the responses:
-					for _, reqStat := range streamReqSeqMap {
-						stated, failed = handleStat(reqStat, logStats, statLog, stated, failed)
-					}
-
-					glog.Infof("Reported unmatched reqs.  Stated : %d  Failed : %d (sum : %d).\n",
-						stated,
-						failed,
-						stated+failed)
-				}
-
-				// Calculate average round trip time and standard deviation
-				var avg float64 = 0
-				var std float64 = 0
-				for _, rtt := range rtts {
-					avg += rtt
-				}
-				if nv := len(rtts); nv != 0 {
-					avg = avg / float64(nv)
-				}
-
-				for _, rtt := range rtts {
-					diff := avg - rtt
-					std += diff * diff
-				}
-				if nv := len(rtts); nv != 0 {
-					std = std / float64(nv)
-				}
-
-				numRespStated := stated - len(streamReqSeqMap)
-				// prevent DVZ
-				if numRespStated == 0 {
-					numRespStated = -1
-				}
-
-				smryString := fmt.Sprintf("Stated : %d  Failed : %d.  Flawed Streams: %d.  Mismatched RCs: %d (%3.3f%%).  Avg RTT %f sdev : %f.  Unmatched reqs: %d.  Unmatched resps : %d.  Flawed Reqs : %d.  Flawed Resps : %d.  Dropped : %d Pcap req errs : %d, Pcap resp errs : %d",
-					stated,
-					failed,
-					numBadStreams,
-					numMismatchedRCs,
-					100*float64(numMismatchedRCs)/float64(numRespStated),
-					avg,
-					std,
-					len(streamReqSeqMap),
-					len(streamRespSeqMap),
-					flawedReqStreams,
-					flawedRespStreams,
-					dropped,
-					atomic.LoadUint64(&numPcapReqErrs),
-					atomic.LoadUint64(&numPcapRespErrs))
-
-				glog.Infof("Summary : %s\n", smryString)
-
-				if logStats {
-					statLog.Printf("# Summary:\n")
-					statLog.Printf("# %s\n", smryString)
-				}
-
-				statfile.Close()
-
-				done <- true
-				return
-			}
 		}
 	}
 }
@@ -1158,6 +902,7 @@ func main() {
 	maxprocs := runtime.GOMAXPROCS(-1) // query gomaxprocs
 	glog.Infof("GOMAXPROCS : %d\n", maxprocs)
 
+	rep = NewReporter(*readResponse, *statOutfile, *droppedOutfile)
 	replayStartTime = time.Now()
 
 	// If we are going to force the rate, make sure clockrate is set to 1.0:
@@ -1175,10 +920,6 @@ func main() {
 
 	secondChan := time.Tick(time.Second)
 
-	statRepChan = make(chan *stat, 1024) // don't block proxys waiting to report stats
-	pcapRespRepChan = make(chan *pcapRespinfo, 1024)
-	droppedRepChan = make(chan *reqinfo, 1024)
-
 	inflightChan = make(chan bool, *maxInflight)
 
 	// If configured, let the proxy server know we are starting to zero its timestamp counter:
@@ -1187,8 +928,8 @@ func main() {
 	}
 
 	var lastPacketFiletimeNano int64 = 0
-	doneChan := make(chan bool)
-	go reporting(doneChan)
+	go rep.Report()
+
 	for sent := 0; ; {
 		select {
 		case packet := <-packetsChan:
@@ -1275,9 +1016,9 @@ func main() {
 					atomic.LoadUint64(&numProxyInFlight))
 
 				// tell reporter we're done:
-				doneChan <- true
+				rep.Stop()
 				// and wait for it to be done:
-				<-doneChan
+				rep.SyncFlush()
 
 				elapsed := time.Now().Sub(replayStartTime)
 				glog.Infof("number of connections with lost packets causing data loss: %d\n", numFlushed)
