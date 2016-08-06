@@ -13,6 +13,8 @@ import (
 type reporter struct  {
 	failed                         int
 	stated                         int
+	rtts 			       []float64 //history of round trip times
+
 	logStats                       bool
 	logDropped                     bool
 	expectResponses                bool
@@ -26,7 +28,6 @@ type reporter struct  {
 	droppedRequestReportingChannel chan *reqinfo
 	failedRequestsReportingChannel chan bool
 
-	rtts []float64 //history of round trip times
 
 	log                            *log.Logger
 	droppedLog		       *log.Logger
@@ -34,13 +35,13 @@ type reporter struct  {
 
 func NewReporter(expectResponses bool, statsLogPath string, droppedLogPath string) *reporter {
 
-	var rep reporter = new(reporter)
+	var rep *reporter = new(reporter)
 	rep.statsLogPath = statsLogPath
 	rep.droppedLogPath = droppedLogPath
 	rep.rtts = make([]float64, 0, 10000000)
 
-	rep.logStats = statsLogPath != nil && statsLogPath != ""
-	rep.logDropped = droppedLogPath != nil && droppedLogPath != ""
+	rep.logStats = statsLogPath != ""
+	rep.logDropped = droppedLogPath != ""
 
 	rep.doneChannel = make(chan bool, 1024)
 	rep.requestReportingChannel = make(chan *stat, 1024) // don't block proxys waiting to report stats
@@ -48,7 +49,7 @@ func NewReporter(expectResponses bool, statsLogPath string, droppedLogPath strin
 	rep.droppedRequestReportingChannel = make(chan *reqinfo, 1024)
 	rep.failedRequestsReportingChannel = make(chan bool)
 
-	return &rep
+	return rep
 }
 
 type stat struct {
@@ -66,9 +67,11 @@ func join(strings []string, delimiter byte) string {
 	if (strings == nil || len(strings) == 0) {
 		return ""
 	} else {
-		for _,s := range strings {
-			buffer.WriteByte(delimiter)
+		for i,s := range strings {
 			buffer.WriteString(s)
+			if i < len(strings) - 1 {
+				buffer.WriteByte(delimiter)
+			}
 		}
 	}
 
@@ -110,32 +113,27 @@ func (this *stat) String() string {
 }
 
 
-var rtts = make([]float64, 0, 10000000) // 10 million initial length
-
-func (this reporter) addFailedStat() (int, int) {
+func (this reporter) addFailedStat() {
 	this.failed++
-	return this.stated, this.failed
 }
 
 // log the stat if logging is enabled.  Also keep track of failed results
-func (this reporter) AddStat(someStat *stat) (int, int) {
+func (this reporter) AddStat(someStat *stat) {
 	if someStat != nil {
-		rtts = append(rtts, someStat.RTT)
+		this.rtts = append(this.rtts, someStat.RTT)
 		this.stated++
 
 		if this.logStats {
 			this.log.Println(someStat.String())
 		}
 	}
-
-	return this.stated, this.failed
 }
 
 // goroutine to handle reporting from proxy goroutines
 func (this reporter) Report () {
 
 	var statfile *os.File
-	if this.logStats != "" {
+	if this.logStats {
 		var err error
 		if statfile, err = os.Create(this.statsLogPath); err != nil {
 			glog.Fatalf("Failed to open stat output file %s : %v\n", this.statsLogPath, err)
@@ -144,21 +142,21 @@ func (this reporter) Report () {
 	this.log = log.New(statfile, "", 0)
 
 	var droppedfile *os.File
-	if this.logDropped != "" {
+	if this.logDropped {
 		var err error
 		if droppedfile, err = os.Create(this.droppedLogPath); err != nil {
 			glog.Fatalf("Failed to open dropped output file %s : %v\n", this.droppedLogPath, err)
 		}
 	}
-	droppedLog := log.New(droppedfile, "", 0)
+	this.droppedLog = log.New(droppedfile, "", 0)
 
 	tensecs := time.Tick(time.Second * 10)
 
-	dropped := 0
-	lastStated := 0
-	numMismatchedRCs := 0
+	dropped := 0 //amount of dropped requests
+	lastStated := 0 //amount of recorded stats for which last calculation of rate was performed
+	numMismatchedRCs := 0 //amount of mismatched response codes received by responses during injecting
 
-	lastTime := time.Now()
+	lastTime := time.Now() //last measured time by which we perform rate calculation
 	finishingUp := false
 	for {
 		select {
@@ -185,7 +183,7 @@ func (this reporter) Report () {
 		case someDrop := <- this.droppedRequestReportingChannel:
 			dropped++
 			if this.logDropped {
-				droppedLog.Println(someDrop.String())
+				this.droppedLog.Println(someDrop.String())
 			}
 
 		case somePcapResp := <- this.responseReportingChannel:
@@ -253,7 +251,7 @@ func (this reporter) Report () {
 				if len(streamReqSeqMap) > 0 {
 					// Go through all unmatched reqs and log them without the responses:
 					for _, reqStat := range streamReqSeqMap {
-						this.stated, this.failed = this.AddStat(reqStat)
+						this.AddStat(reqStat)
 					}
 
 					glog.Infof("Reported unmatched reqs.  Stated : %d  Failed : %d (sum : %d).\n",
@@ -263,20 +261,23 @@ func (this reporter) Report () {
 				}
 
 				// Calculate average round trip time and standard deviation
+				// It seems recording a histogram would be better fit here, since we're dealing with latencies.
+				// Consider using go port of HdrHistogram? This would also save up on memory, since
+				// right now we are recording *every* rtt, while the histogram is fixed-size
 				var avg float64 = 0
 				var std float64 = 0
-				for _, rtt := range rtts {
+				for _, rtt := range this.rtts {
 					avg += rtt
 				}
-				if nv := len(rtts); nv != 0 {
+				if nv := len(this.rtts); nv != 0 {
 					avg = avg / float64(nv)
 				}
 
-				for _, rtt := range rtts {
+				for _, rtt := range this.rtts {
 					diff := avg - rtt
 					std += diff * diff
 				}
-				if nv := len(rtts); nv != 0 {
+				if nv := len(this.rtts); nv != 0 {
 					std = std / float64(nv)
 				}
 

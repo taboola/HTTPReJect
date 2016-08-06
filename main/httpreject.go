@@ -83,7 +83,7 @@ var numLateDropped uint64 = 0
 var numPcapReqErrs uint64 = 0
 var numPcapRespErrs uint64 = 0
 var numBadStreams uint64 = 0
-var rep reporter
+var rep *reporter
 // Global to get packet info in httpStreamFactory New:
 var curPacket *gopacket.Packet
 
