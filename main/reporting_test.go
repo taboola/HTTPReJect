@@ -5,7 +5,7 @@ import (
 	"io/ioutil"
 	"strings"
 	"fmt"
-	"time"
+	//"time"
 )
 
 func TestJoin(t *testing.T) {
@@ -42,9 +42,6 @@ func TestJoinNilArray(t *testing.T) {
 }
 
 
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
-
 var stats1_file_path = "testdata\\stats1.txt"
 var dropped1_file_path = "testdata\\dropped1.txt"
 
@@ -70,7 +67,7 @@ func TestRecordRefactored(t *testing.T) {
 		expectedData: info.String(),
 	}
 
-	reporterTestHelper(repFunc, rep, t, expect)
+	testReporter(repFunc, rep, t, expect)
 }
 
 type reportFunc func(*testing.T, *reporter)
@@ -79,11 +76,19 @@ type expectedFileResult struct {
 	expectedData string
 }
 
-func reporterTestHelper(f reportFunc, rep *reporter, t *testing.T, expectedResults ...expectedFileResult) {
+// A general wrapper for testing reporter functionality.
+// Since there is currently quite some boilerplate around proper initialization and shutdown of the reporter,
+// this should keep the boilerplate to a single place.
+// The idea is that f (the reportFunc) does the actual logic that requires testing,
+// rep is the reporter which we are testing,
+// t is the testing context,
+// expectedResults are the expected (file, data) couples - yes, we are currently comparing file-to-string. (maybe file-to-file?)
+func testReporter(f reportFunc, rep *reporter, t *testing.T, expectedResults ...expectedFileResult) {
 
 	go rep.Report()
-	time.Sleep(1 * time.Second)
+	//time.Sleep(1 * time.Second)
 	f(t, rep)
+	rep.AwaitInitialization() //we need this here to prevent a race condition with the reporting functionality (see function docs)
 	rep.Stop()
 	rep.SyncFlush()
 

@@ -8,12 +8,17 @@ import (
 	"sync/atomic"
 	"fmt"
 	"bytes"
+	"errors"
 )
 
+// Note that even though we do perform atomic operations on stopCalled, since it is an int32 we do not require it
+// to be on an 8-byte aligned address (see class doc of doc.go - atomic operations)
+// It currently does happen to be 8-byte aligned, but that is just a coincidence, and again, is irrelevant.
 type reporter struct  {
 	failed                         int
 	stated                         int
 	rtts 			       []float64 //history of round trip times
+	stopCalled		       int32
 
 	logStats                       bool
 	logDropped                     bool
@@ -22,6 +27,7 @@ type reporter struct  {
 	statsLogPath                   string
 	droppedLogPath                 string
 
+	initiatedChannel 	       chan bool //channel through which we signal that the initialization has completed.
 	doneChannel                    chan bool
 	requestReportingChannel        chan *stat
 	responseReportingChannel       chan *pcapRespinfo
@@ -43,6 +49,7 @@ func NewReporter(expectResponses bool, statsLogPath string, droppedLogPath strin
 	rep.logStats = statsLogPath != ""
 	rep.logDropped = droppedLogPath != ""
 
+	rep.initiatedChannel = make(chan bool, 1)
 	rep.doneChannel = make(chan bool, 1024)
 	rep.requestReportingChannel = make(chan *stat, 1024) // don't block proxys waiting to report stats
 	rep.responseReportingChannel = make(chan *pcapRespinfo, 1024)
@@ -78,12 +85,56 @@ func join(strings []string, delimiter byte) string {
 	return buffer.String()
 }
 
-func (this reporter) Stop() {
-	this.doneChannel <- true
+// wait until all initialization has been performed by the reporter
+// note that this does *not* mean that the reporter has entered the select-clause!
+// it only means that all initialization is done. This should be used to prevent race conditions
+// by calling this function *before* closing the reporter, from within the *same* goroutine.
+// example code:
+//
+// 	func foo(rep *reporter) {
+//		go rep.Report()
+//		rep.ReportDropped(...)
+//		rep.AwaitInitialization()
+//		rep.Stop()
+//		rep.SyncFlush()
+//	}
+//
+// Note that in the example, we perform the actual reporting actions (in this case reporting a dropped request)
+// before calling this method. Calling this method before reporting will not guarantee that initialization had been finished
+// and in fact, there is no reason (currently) to require such a mechanism.
+//
+// As to the implementation, since initiatedChannel is a buffered channel of size 1, more should
+// be false any time it is received from. It is only required since this function may be called from
+// many different clients, in which case sampling the channel would have no effect since it is already closed (except
+// for the one client who receives the message).
+func (this reporter) AwaitInitialization() {
+	if _, more := <- this.initiatedChannel; !more {
+		return
+	}
+
 }
 
-func (this reporter) SyncFlush() {
-	<- this.doneChannel
+//Signals the reporter to stop reporting,
+//once all previously delivered stats have been handled.
+//stats which have been submitted after calling Stop() may also be handled,
+//but there is no guarantee that this will happen and how many of them will be handled.
+func (this reporter) Stop() {
+	this.doneChannel <- true
+	atomic.StoreInt32(&this.stopCalled, 1)
+}
+
+//wait until all stats which were submitted before calling Stop() have been handled.
+//this function may return after some stats have been handled which were submitted after Stop() was called -
+//see Stop's docs.
+//calling this function before calling Stop() will result in no wait being performed,
+//instead an error being immediately returned
+func (this reporter) SyncFlush() error {
+	if (atomic.LoadInt32(&this.stopCalled) == 1) {
+		<- this.doneChannel
+		return nil
+	} else  {
+		return errors.New("SyncFlush called before Stop")
+	}
 }
 
 func (this reporter) ReportDropped(droppedRequestInfo *reqinfo) {
@@ -158,6 +209,7 @@ func (this reporter) Report () {
 
 	lastTime := time.Now() //last measured time by which we perform rate calculation
 	finishingUp := false
+	this.initiatedChannel <- true
 	for {
 		select {
 		case someStat := <- this.requestReportingChannel:
