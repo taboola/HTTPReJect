@@ -54,7 +54,7 @@ func NewReporter(expectResponses bool, statsLogPath string, droppedLogPath strin
 	rep.requestReportingChannel = make(chan *stat, 1024) // don't block proxys waiting to report stats
 	rep.responseReportingChannel = make(chan *pcapRespinfo, 1024)
 	rep.droppedRequestReportingChannel = make(chan *reqinfo, 1024)
-	rep.failedRequestsReportingChannel = make(chan bool)
+	rep.failedRequestsReportingChannel = make(chan bool, 1024)
 
 	return rep
 }
@@ -107,7 +107,7 @@ func join(strings []string, delimiter byte) string {
 // be false any time it is received from. It is only required since this function may be called from
 // many different clients, in which case sampling the channel would have no effect since it is already closed (except
 // for the one client who receives the message).
-func (this reporter) AwaitInitialization() {
+func (this *reporter) AwaitInitialization() {
 	if _, more := <- this.initiatedChannel; !more {
 		return
 	}
@@ -118,7 +118,7 @@ func (this reporter) AwaitInitialization() {
 //once all previously delivered stats have been handled.
 //stats which have been submitted after calling Stop() may also be handled,
 //but there is no guarantee that this will happen and how many of them will be handled.
-func (this reporter) Stop() {
+func (this *reporter) Stop() {
 	this.doneChannel <- true
 	atomic.StoreInt32(&this.stopCalled, 1)
 }
@@ -128,7 +128,7 @@ func (this reporter) Stop() {
 //see Stop's docs.
 //calling this function before calling Stop() will result in no wait being performed,
 //instead an error being immediately returned
-func (this reporter) SyncFlush() error {
+func (this *reporter) SyncFlush() error {
 	if (atomic.LoadInt32(&this.stopCalled) == 1) {
 		<- this.doneChannel
 		return nil
@@ -137,19 +137,19 @@ func (this reporter) SyncFlush() error {
 	}
 }
 
-func (this reporter) ReportDropped(droppedRequestInfo *reqinfo) {
+func (this *reporter) ReportDropped(droppedRequestInfo *reqinfo) {
 	this.droppedRequestReportingChannel <-	droppedRequestInfo
 }
 
-func (this reporter) ReportStat(requestStats *stat) {
+func (this *reporter) ReportStat(requestStats *stat) {
 	this.requestReportingChannel <- requestStats
 }
 
-func (this reporter) ReportFailedStat() {
+func (this *reporter) ReportFailedStat() {
 	this.failedRequestsReportingChannel <- true
 }
 
-func (this reporter) ReportResponse(responseInfo *pcapRespinfo) {
+func (this *reporter) ReportResponse(responseInfo *pcapRespinfo) {
 	this.responseReportingChannel <- responseInfo
 }
 
@@ -164,12 +164,12 @@ func (this *stat) String() string {
 }
 
 
-func (this reporter) addFailedStat() {
+func (this *reporter) addFailedStat() {
 	this.failed++
 }
 
 // log the stat if logging is enabled.  Also keep track of failed results
-func (this reporter) AddStat(someStat *stat) {
+func (this *reporter) AddStat(someStat *stat) {
 	if someStat != nil {
 		this.rtts = append(this.rtts, someStat.RTT)
 		this.stated++
@@ -181,7 +181,7 @@ func (this reporter) AddStat(someStat *stat) {
 }
 
 // goroutine to handle reporting from proxy goroutines
-func (this reporter) Report () {
+func (this *reporter) Report () {
 
 	var statfile *os.File
 	if this.logStats {

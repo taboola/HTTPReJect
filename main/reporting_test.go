@@ -45,7 +45,7 @@ func TestJoinNilArray(t *testing.T) {
 var stats1_file_path = "testdata\\stats1.txt"
 var dropped1_file_path = "testdata\\dropped1.txt"
 
-func TestRecordRefactored(t *testing.T) {
+func TestReporter_ReportDropped(t *testing.T) {
 	info := &reqinfo{
 		URL: 	      "\\test\\abc",
 		TS:           1000,
@@ -56,7 +56,6 @@ func TestRecordRefactored(t *testing.T) {
 	}
 
 	repFunc := func(t *testing.T, rep *reporter) {
-		fmt.Println("hello")
 		rep.ReportDropped(info)
 	}
 
@@ -67,7 +66,24 @@ func TestRecordRefactored(t *testing.T) {
 		expectedData: info.String(),
 	}
 
-	testReporter(repFunc, rep, t, expect)
+	testReporterFile(repFunc, rep, t, expect)
+}
+
+func TestReporter_ReportFailedStat(t *testing.T) {
+	numFailed := 15
+	f := func(t *testing.T, rep *reporter) {
+		for i := 0; i < numFailed; i++ {
+			rep.ReportFailedStat()
+		}
+	}
+
+	rep := NewReporter(true, stats1_file_path, dropped1_file_path)
+
+	pred := func(rep *reporter) (bool, string) {
+		return rep.failed == numFailed, fmt.Sprintf("Expected failed = %v got %v", numFailed, rep.failed)
+	}
+
+	testReporter(f, rep, t, pred)
 }
 
 type reportFunc func(*testing.T, *reporter)
@@ -83,27 +99,39 @@ type expectedFileResult struct {
 // rep is the reporter which we are testing,
 // t is the testing context,
 // expectedResults are the expected (file, data) couples - yes, we are currently comparing file-to-string. (maybe file-to-file?)
-func testReporter(f reportFunc, rep *reporter, t *testing.T, expectedResults ...expectedFileResult) {
+func testReporterFile(f reportFunc, rep *reporter, t *testing.T, expectedResults ...expectedFileResult) {
 
+	pred := func(r *reporter) (bool, string) {
+		for i, expectedRes := range expectedResults {
+			if bytes, err := ioutil.ReadFile(expectedRes.filePath); err != nil {
+				return false, fmt.Sprintf("Could not open file %v due to %v", expectedRes.filePath, err)
+			} else {
+				want := strings.TrimSpace(expectedRes.expectedData)
+				got := strings.TrimSpace(string(bytes))
+
+				if compareResult := strings.Compare(want, got); compareResult != 0 {
+					return false, fmt.Sprintf("In file(#%v): %v\nWanted: " +
+					"compare = 0, got: compare = %v, want_str = %v, got_str = %v",
+						i, expectedRes.filePath, compareResult, want, got)
+
+				}
+			}
+		}
+		return true, ""
+	}
+
+	testReporter(f, rep, t, pred)
+}
+
+func testReporter(f reportFunc, rep *reporter, t *testing.T, predicate func (*reporter) (bool, string)) {
 	go rep.Report()
-	//time.Sleep(1 * time.Second)
 	f(t, rep)
+
 	rep.AwaitInitialization() //we need this here to prevent a race condition with the reporting functionality (see function docs)
 	rep.Stop()
 	rep.SyncFlush()
 
-	for i, expectedRes := range expectedResults {
-		if bytes, err := ioutil.ReadFile(expectedRes.filePath); err != nil {
-			t.Errorf("Could not open file %v due to %v", expectedRes.filePath, err)
-		} else {
-			want := strings.TrimSpace(expectedRes.expectedData)
-			got := strings.TrimSpace(string(bytes))
-
-			if compareResult := strings.Compare(want, got); compareResult != 0 {
-				t.Errorf("In file(#%v): %v\nWanted: " +
-				"compare = 0, got: compare = %v, want_str = %v, got_str = %v",
-					i, expectedRes.filePath, compareResult, want, got)
-			}
-		}
+	if res, msg := predicate(rep); !res {
+		t.Errorf("Failed: %v", msg)
 	}
 }
