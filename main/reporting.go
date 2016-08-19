@@ -167,7 +167,7 @@ func (this *reporter) addFailedStat() {
 }
 
 // log the stat if logging is enabled.  Also keep track of failed results
-func (this *reporter) AddStat(someStat *stat) {
+func (this *reporter) addStat(someStat *stat) {
 	if someStat != nil {
 		this.rtts = append(this.rtts, someStat.RTT)
 		this.stated++
@@ -223,36 +223,31 @@ func (this *reporter) Report () {
 
 		case <-tensecs:
 
-			// calculate rate of handled requests/responses and update state counters (lastStated & lastTime)
-			// for the next calculation
-			diffStated := this.stated - lastStated
-			lastStated = this.stated
-			now := time.Now()
-			rate := float64(diffStated) / now.Sub(lastTime).Seconds()
-			lastTime = now
+		// calculate rate of handled requests/responses and update state counters (lastStated & lastTime)
+		// for the next calculation
+		diffStated := this.stated - lastStated
+		lastStated = this.stated
+		now := time.Now()
+		rate := float64(diffStated) / now.Sub(lastTime).Seconds()
+		lastTime = now
 
-			//var repstate string
-			//if finishingUp {
-			//	repstate = "Finishing Up"
-			//} else {
-			//	repstate = "Still Running"
-			//}
-
-			//glog.Infof("%s: rate : %f  Reported : %d  Failed : %d.  Flawed : %d.  reqs : %d, proxySent : %d, sleeping : %d, inFlight : %d, lateDropped : %d\n",
-			glog.Infof("rate : %f  Reported : %d  Failed : %d.  Flawed : %d.  reqs : %d, proxySent : %d, sleeping : %d, inFlight : %d, lateDropped : %d\n",
-				//repstate,
-				rate,
-				this.stated,
-				this.failed,
-				atomic.LoadUint64(&numBadStreams),
-				atomic.LoadUint64(&totNumReqs),
-				atomic.LoadUint64(&numProxySent),
-				atomic.LoadUint64(&numProxySleeping),
-				atomic.LoadUint64(&numProxyInFlight),
-				atomic.LoadUint64(&numLateDropped))
+		// No more "finishing up" state - it now happens in one step.
+		repstate := "Still Running"
+		glog.Infof("%s: rate : %f  Reported : %d  Failed : %d.  Flawed : %d.  reqs : %d, proxySent : %d, sleeping : %d, inFlight : %d, lateDropped : %d\n",
+			repstate,
+			rate,
+			this.stated,
+			this.failed,
+			atomic.LoadUint64(&numBadStreams),
+			atomic.LoadUint64(&totNumReqs),
+			atomic.LoadUint64(&numProxySent),
+			atomic.LoadUint64(&numProxySleeping),
+			atomic.LoadUint64(&numProxyInFlight),
+			atomic.LoadUint64(&numLateDropped))
 
 		case <-this.requestToFinishChannel:
-			glog.Info("Got done notification, emptying rest of data")
+			glog.V(2).Info("Got done notification, emptying rest of data")
+
 			finishedEmptying := false
 			for !finishedEmptying {
 				select {
@@ -274,7 +269,7 @@ func (this *reporter) Report () {
 				}
 			}
 
-			glog.Info("After emptying rest of data, printing")
+			glog.V(2).Info("After emptying rest of data, printing")
 			this.finish(statfile, droppedfile)
 			this.notifyFinishedChannel <- true
 		}
@@ -283,8 +278,6 @@ func (this *reporter) Report () {
 
 // returns whether the incoming stat had a mismatched return code
 func (this *reporter) handleRequestStat(someStat *stat) {
-	glog.Info("Received stat")
-
 	if this.expectResponses && someStat != nil {
 		// do we have the other side?
 		key := streamKey{someStat.streamNum, someStat.reqNum}
@@ -293,7 +286,7 @@ func (this *reporter) handleRequestStat(someStat *stat) {
 
 			presp.OrigRTT = float64(presp.Resptime-someStat.TS) / float64(time.Second)
 			someStat.pcapRespinfo = *presp
-			this.AddStat(someStat)
+			this.addStat(someStat)
 			if someStat.OrigRC != someStat.RC {
 				this.numMismatchedRCs++
 			}
@@ -301,12 +294,11 @@ func (this *reporter) handleRequestStat(someStat *stat) {
 			streamReqSeqMap[key] = someStat
 		}
 	} else {
-		this.AddStat(someStat)
+		this.addStat(someStat)
 	}
 }
 
 func (this *reporter) handleDroppedStat(req *reqinfo) {
-	glog.Info("Got dropped")
 	this.dropped++
 	if this.logDropped {
 		this.droppedLog.Println(req.String())
@@ -314,15 +306,14 @@ func (this *reporter) handleDroppedStat(req *reqinfo) {
 }
 
 func (this *reporter) handleResponseStat(somePcapResp *pcapRespinfo) {
-	glog.Info("Got response")
-	// do we have the other side?
 	if somePcapResp != nil {
+		// do we have the other side?
 		key := streamKey{somePcapResp.respStreamNum, somePcapResp.respNum}
 		if reqstat, is := streamReqSeqMap[key]; is {
 			delete(streamReqSeqMap, key)
 			somePcapResp.OrigRTT = float64(somePcapResp.Resptime-reqstat.TS) / float64(time.Second)
 			reqstat.pcapRespinfo = *somePcapResp
-			this.AddStat(reqstat)
+			this.addStat(reqstat)
 			if reqstat.OrigRC != reqstat.RC {
 				this.numMismatchedRCs++
 			}
@@ -346,7 +337,7 @@ func (this *reporter) finish(statFile *os.File, droppedFile *os.File) {
 	if len(streamReqSeqMap) > 0 {
 		// Go through all unmatched reqs and log them without the responses:
 		for _, reqStat := range streamReqSeqMap {
-			this.AddStat(reqStat)
+			this.addStat(reqStat)
 		}
 
 		glog.Infof("Reported unmatched reqs.  Stated : %d  Failed : %d (sum : %d).\n",

@@ -54,6 +54,150 @@ var dropped2_file_path = base_dropped_file_path + "2.txt"
 var stats3_file_path = base_stats_file_path + "3.txt"
 var dropped3_file_path = base_dropped_file_path + "3.txt"
 
+var stats4_file_path = base_stats_file_path + "4.txt"
+var dropped4_file_path = base_dropped_file_path + "4.txt"
+
+var stats5_file_path = base_stats_file_path + "5.txt"
+var dropped5_file_path = base_dropped_file_path + "5.txt"
+
+var stats6_file_path = base_stats_file_path + "6.txt"
+var dropped6_file_path = base_dropped_file_path + "6.txt"
+
+func TestReporter_ReportManyRequests(t *testing.T) {
+	info := &reqinfo{
+		URL: 		"\\test\\abc",
+		TS: 		time.Now().UnixNano(),
+		ReqLen: 	1024,
+		TimeAccuracy: 	77,
+		streamNum: 	5,
+		reqNum: 	1,
+	}
+
+	stat := &stat{
+		reqinfo: 	*info,
+		pcapRespinfo: 	*new(pcapRespinfo),
+		RTT: 		510,
+		RC:		500,
+		RespLen:	1024,
+		respMatch: 	make([]string, 0),
+	}
+
+	repFunc := func(t *testing.T, rep *reporter) {
+		for i:=0; i<100;i++ {
+			rep.ReportStat(stat)
+		}
+	}
+
+	rep := NewReporter(true, stats4_file_path, dropped4_file_path)
+
+	expect := expectedFileResult{
+		filePath:	stats4_file_path,
+		predicate: 	func (s string) bool {
+			return rep.numMismatchedRCs == 0 &&
+			rep.stated == 100 &&
+			rep.failed == 0 &&
+			rep.dropped == 0 &&
+			len(rep.rtts) == 100 &&
+			rep.rtts[0] == 510 &&
+			strings.Contains(s, stat.String())
+		},
+	}
+
+	testReporterFile(repFunc, rep, t, expect)
+}
+
+func TestReporter_ReportRequestNoResponse(t *testing.T) {
+	info := &reqinfo{
+		URL: 		"\\test\\abc",
+		TS: 		time.Now().UnixNano(),
+		ReqLen: 	1024,
+		TimeAccuracy: 	77,
+		streamNum: 	5,
+		reqNum: 	1,
+	}
+
+	stat := &stat{
+		reqinfo: 	*info,
+		pcapRespinfo: 	*new(pcapRespinfo),
+		RTT: 		510,
+		RC:		500,
+		RespLen:	1024,
+		respMatch: 	make([]string, 0),
+	}
+
+	repFunc := func(t *testing.T, rep *reporter) {
+		rep.ReportStat(stat)
+	}
+
+	rep := NewReporter(true, stats5_file_path, dropped5_file_path)
+
+	expect := expectedFileResult{
+		filePath:	stats5_file_path,
+		predicate: 	func (s string) bool {
+			return rep.numMismatchedRCs == 0 &&
+			rep.stated == 1 &&
+			rep.failed == 0 &&
+			rep.dropped == 0 &&
+			len(rep.rtts) == 1 &&
+			rep.rtts[0] == 510 &&
+			strings.Contains(s, stat.String())
+		},
+	}
+
+	testReporterFile(repFunc, rep, t, expect)
+}
+
+func TestReporter_ReportRequestBeforeResponse(t *testing.T) {
+	info := &reqinfo{
+		URL: 		"\\test\\abc",
+		TS: 		time.Now().UnixNano(),
+		ReqLen: 	1024,
+		TimeAccuracy: 	77,
+		streamNum: 	5,
+		reqNum: 	1,
+	}
+
+	resp := &pcapRespinfo{
+		Resptime:       info.TS + 200,
+		OrigRlen:      	1024,
+		OrigRC:      	500,
+		OrigRTT:       	0,
+		respStreamNum: 	5,
+		respNum:       	1,
+	}
+	stat := &stat{
+		reqinfo: 	*info,
+		pcapRespinfo: 	*new(pcapRespinfo),
+		RTT: 		510,
+		RC:		500,
+		RespLen:	1024,
+		respMatch: 	make([]string, 0),
+	}
+
+	repFunc := func(t *testing.T, rep *reporter) {
+		rep.ReportStat(stat)
+		rep.ReportResponse(resp)
+	}
+
+	rep := NewReporter(true, stats6_file_path, dropped6_file_path)
+
+	expect := expectedFileResult{
+		filePath:	stats6_file_path,
+		predicate: 	func (s string) bool {
+			return rep.numMismatchedRCs == 0 &&
+			rep.stated == 1 &&
+			rep.failed == 0 &&
+			rep.dropped == 0 &&
+			len(rep.rtts) == 1 &&
+			rep.rtts[0] == 510 &&
+			strings.Contains(s, stat.String())
+		},
+	}
+
+	testReporterFile(repFunc, rep, t, expect)
+}
+
+
 func TestReporter_ReportDropped(t *testing.T) {
 	info := &reqinfo{
 		URL: 	      "\\test\\abc",
@@ -170,12 +314,16 @@ func testReporterFile(f reportFunc, rep *reporter, t *testing.T, expectedResults
 
 func testReporter(f reportFunc, rep *reporter, t *testing.T, predicate func (*reporter) (bool, string)) {
 	go rep.Report()
-	time.Sleep(time.Second)
+	//time.Sleep(time.Second)
 	f(t, rep)
 
 	rep.AwaitInitialization() //we need this here to prevent a race condition with the reporting functionality (see function docs)
 	rep.Stop()
 	rep.SyncFlush()
+
+	//reset data
+	streamReqSeqMap = make(map[streamKey]*stat)
+	streamRespSeqMap = make(map[streamKey]*pcapRespinfo)
 
 	if res, msg := predicate(rep); !res {
 		t.Errorf("Failed: %v", msg)
