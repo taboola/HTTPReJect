@@ -321,10 +321,6 @@ func testReporter(f reportFunc, rep *reporter, t *testing.T, predicate func (*re
 	rep.Stop()
 	rep.SyncFlush()
 
-	//reset data
-	streamReqSeqMap = make(map[streamKey]*stat)
-	streamRespSeqMap = make(map[streamKey]*pcapRespinfo)
-
 	if res, msg := predicate(rep); !res {
 		t.Errorf("Failed: %v", msg)
 	}

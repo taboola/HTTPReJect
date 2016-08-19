@@ -35,6 +35,10 @@ type reporter struct  {
 	droppedRequestReportingChannel chan *reqinfo
 	failedRequestsReportingChannel chan bool
 
+	// We will have two maps as we don't know the order that requests/responses will be processed after
+	// reading from the pcap as they will race:
+	streamReqSeqMap 	       map[streamKey]*stat
+	streamRespSeqMap	       map[streamKey]*pcapRespinfo
 
 	log                            *log.Logger
 	droppedLog                     *log.Logger
@@ -58,6 +62,9 @@ func NewReporter(expectResponses bool, statsLogPath string, droppedLogPath strin
 	rep.droppedRequestReportingChannel = make(chan *reqinfo, 1024)
 	rep.failedRequestsReportingChannel = make(chan bool, 1024)
 
+	rep.streamReqSeqMap = make(map[streamKey]*stat)
+	rep.streamRespSeqMap = make(map[streamKey]*pcapRespinfo)
+	
 	return rep
 }
 
@@ -281,8 +288,8 @@ func (this *reporter) handleRequestStat(someStat *stat) {
 	if this.expectResponses && someStat != nil {
 		// do we have the other side?
 		key := streamKey{someStat.streamNum, someStat.reqNum}
-		if presp, is := streamRespSeqMap[key]; is {
-			delete(streamRespSeqMap, key)
+		if presp, is := this.streamRespSeqMap[key]; is {
+			delete(this.streamRespSeqMap, key)
 
 			presp.OrigRTT = float64(presp.Resptime-someStat.TS) / float64(time.Second)
 			someStat.pcapRespinfo = *presp
@@ -291,7 +298,7 @@ func (this *reporter) handleRequestStat(someStat *stat) {
 				this.numMismatchedRCs++
 			}
 		} else {
-			streamReqSeqMap[key] = someStat
+			this.streamReqSeqMap[key] = someStat
 		}
 	} else {
 		this.addStat(someStat)
@@ -309,8 +316,8 @@ func (this *reporter) handleResponseStat(somePcapResp *pcapRespinfo) {
 	if somePcapResp != nil {
 		// do we have the other side?
 		key := streamKey{somePcapResp.respStreamNum, somePcapResp.respNum}
-		if reqstat, is := streamReqSeqMap[key]; is {
-			delete(streamReqSeqMap, key)
+		if reqstat, is := this.streamReqSeqMap[key]; is {
+			delete(this.streamReqSeqMap, key)
 			somePcapResp.OrigRTT = float64(somePcapResp.Resptime-reqstat.TS) / float64(time.Second)
 			reqstat.pcapRespinfo = *somePcapResp
 			this.addStat(reqstat)
@@ -318,7 +325,7 @@ func (this *reporter) handleResponseStat(somePcapResp *pcapRespinfo) {
 				this.numMismatchedRCs++
 			}
 		} else {
-			streamRespSeqMap[key] = somePcapResp
+			this.streamRespSeqMap[key] = somePcapResp
 		}
 	}
 }
@@ -329,14 +336,14 @@ func (this *reporter) finish(statFile *os.File, droppedFile *os.File) {
 		this.stated,
 		this.failed,
 		atomic.LoadUint64(&numBadStreams),
-		len(streamReqSeqMap),
-		len(streamRespSeqMap),
+		len(this.streamReqSeqMap),
+		len(this.streamRespSeqMap),
 		atomic.LoadUint64(&numPcapReqErrs),
 		atomic.LoadUint64(&numPcapRespErrs))
 
-	if len(streamReqSeqMap) > 0 {
+	if len(this.streamReqSeqMap) > 0 {
 		// Go through all unmatched reqs and log them without the responses:
-		for _, reqStat := range streamReqSeqMap {
+		for _, reqStat := range this.streamReqSeqMap {
 			this.addStat(reqStat)
 		}
 
@@ -352,7 +359,7 @@ func (this *reporter) finish(statFile *os.File, droppedFile *os.File) {
 	// right now we are recording *every* rtt, while the histogram is fixed-size
 	avg, std := summarize(this.rtts)
 
-	numRespStated := this.stated - len(streamReqSeqMap)
+	numRespStated := this.stated - len(this.streamReqSeqMap)
 	// prevent DVZ
 	if numRespStated == 0 {
 		numRespStated = -1
@@ -366,8 +373,8 @@ func (this *reporter) finish(statFile *os.File, droppedFile *os.File) {
 		100*float64(this.numMismatchedRCs)/float64(numRespStated),
 		avg,
 		std,
-		len(streamReqSeqMap),
-		len(streamRespSeqMap),
+		len(this.streamReqSeqMap),
+		len(this.streamRespSeqMap),
 		flawedReqStreams,
 		flawedRespStreams,
 		this.dropped,

@@ -177,12 +177,6 @@ type streamKey struct {
 }
 
 var pcapNetReqRespMap = make(map[netKey]uint64)
-
-// We will have two maps as we don't know the order that requests/responses will be processed after
-// reading from the pcap as they will race:
-var streamReqSeqMap = make(map[streamKey]*stat)
-var streamRespSeqMap = make(map[streamKey]*pcapRespinfo)
-
 type RunnerType int
 
 const (
