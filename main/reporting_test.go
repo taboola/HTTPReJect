@@ -5,7 +5,8 @@ import (
 	"io/ioutil"
 	"strings"
 	"fmt"
-	//"time"
+	"time"
+	"github.com/golang/glog"
 )
 
 func TestJoin(t *testing.T) {
@@ -41,9 +42,17 @@ func TestJoinNilArray(t *testing.T) {
 	}
 }
 
+var base_stats_file_path = "testdata\\out\\stats"
+var base_dropped_file_path = "testdata\\out\\dropped"
 
-var stats1_file_path = "testdata\\stats1.txt"
-var dropped1_file_path = "testdata\\dropped1.txt"
+var stats1_file_path = base_stats_file_path + "1.txt"
+var dropped1_file_path = base_dropped_file_path + "1.txt"
+
+var stats2_file_path = base_stats_file_path + "2.txt"
+var dropped2_file_path = base_dropped_file_path + "2.txt"
+
+var stats3_file_path = base_stats_file_path + "3.txt"
+var dropped3_file_path = base_dropped_file_path + "3.txt"
 
 func TestReporter_ReportDropped(t *testing.T) {
 	info := &reqinfo{
@@ -63,7 +72,9 @@ func TestReporter_ReportDropped(t *testing.T) {
 
 	expect := expectedFileResult{
 		filePath: dropped1_file_path,
-		expectedData: info.String(),
+		predicate: func (s string) bool {
+			return strings.Compare(s, info.String()) == 0
+		},
 	}
 
 	testReporterFile(repFunc, rep, t, expect)
@@ -77,7 +88,7 @@ func TestReporter_ReportFailedStat(t *testing.T) {
 		}
 	}
 
-	rep := NewReporter(true, stats1_file_path, dropped1_file_path)
+	rep := NewReporter(true, stats2_file_path, dropped2_file_path)
 
 	pred := func(rep *reporter) (bool, string) {
 		return rep.failed == numFailed, fmt.Sprintf("Expected failed = %v got %v", numFailed, rep.failed)
@@ -86,10 +97,47 @@ func TestReporter_ReportFailedStat(t *testing.T) {
 	testReporter(f, rep, t, pred)
 }
 
+func TestReporter_ReportUnmatchedResponse(t *testing.T) {
+	respInfo := &pcapRespinfo{
+		Resptime:      500,
+		OrigRlen:      1024,
+		OrigRC:      500,
+		OrigRTT:       17,
+		respStreamNum: 7,
+		respNum:       7,
+	}
+
+	f := func(t *testing.T, rep *reporter) {
+		rep.ReportResponse(respInfo)
+	}
+
+	rep := NewReporter(true, stats3_file_path, dropped3_file_path)
+
+	statsRes := expectedFileResult{
+		filePath: stats3_file_path,
+		predicate: func (s string) bool {
+			return strings.Contains(strings.ToLower(s), "unmatched resps : 1")
+		},
+	}
+
+	droppedRes := newEmptyResult(dropped3_file_path)
+
+	testReporterFile(f, rep, t, statsRes, droppedRes)
+}
+
 type reportFunc func(*testing.T, *reporter)
 type expectedFileResult struct {
 	filePath string
-	expectedData string
+	predicate func (string) bool
+}
+
+func newEmptyResult(filePath string) expectedFileResult {
+	res := expectedFileResult{
+		filePath: filePath,
+		predicate: func(s string) bool {return strings.Compare(s, "") == 0},
+	}
+
+	return res
 }
 
 // A general wrapper for testing reporter functionality.
@@ -102,18 +150,15 @@ type expectedFileResult struct {
 func testReporterFile(f reportFunc, rep *reporter, t *testing.T, expectedResults ...expectedFileResult) {
 
 	pred := func(r *reporter) (bool, string) {
-		for i, expectedRes := range expectedResults {
+		for _, expectedRes := range expectedResults {
 			if bytes, err := ioutil.ReadFile(expectedRes.filePath); err != nil {
 				return false, fmt.Sprintf("Could not open file %v due to %v", expectedRes.filePath, err)
 			} else {
-				want := strings.TrimSpace(expectedRes.expectedData)
 				got := strings.TrimSpace(string(bytes))
 
-				if compareResult := strings.Compare(want, got); compareResult != 0 {
-					return false, fmt.Sprintf("In file(#%v): %v\nWanted: " +
-					"compare = 0, got: compare = %v, want_str = %v, got_str = %v",
-						i, expectedRes.filePath, compareResult, want, got)
-
+				if result := expectedRes.predicate(got); !result {
+					return false, fmt.Sprintf("In file %v, got_str = %v",
+						expectedRes.filePath, got)
 				}
 			}
 		}
@@ -125,6 +170,7 @@ func testReporterFile(f reportFunc, rep *reporter, t *testing.T, expectedResults
 
 func testReporter(f reportFunc, rep *reporter, t *testing.T, predicate func (*reporter) (bool, string)) {
 	go rep.Report()
+	time.Sleep(time.Second)
 	f(t, rep)
 
 	rep.AwaitInitialization() //we need this here to prevent a race condition with the reporting functionality (see function docs)
@@ -134,4 +180,6 @@ func testReporter(f reportFunc, rep *reporter, t *testing.T, predicate func (*re
 	if res, msg := predicate(rep); !res {
 		t.Errorf("Failed: %v", msg)
 	}
+
+	glog.Flush()
 }

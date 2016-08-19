@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"fmt"
 	"bytes"
-	"errors"
 )
 
 // Note that even though we do perform atomic operations on stopCalled, since it is an int32 we do not require it
@@ -17,8 +16,9 @@ import (
 type reporter struct  {
 	failed                         int
 	stated                         int
-	rtts 			       []float64 //history of round trip times
-	stopCalled		       int32
+	dropped			       int
+	rtts                           []float64 //history of round trip times
+	numMismatchedRCs	       int
 
 	logStats                       bool
 	logDropped                     bool
@@ -27,8 +27,9 @@ type reporter struct  {
 	statsLogPath                   string
 	droppedLogPath                 string
 
-	initiatedChannel 	       chan bool //channel through which we signal that the initialization has completed.
-	doneChannel                    chan bool
+	initiatedChannel               chan bool //channel through which we signal that the initialization has completed.
+	requestToFinishChannel         chan bool
+	notifyFinishedChannel          chan bool //channel through which we signal to clients that finishing is done.
 	requestReportingChannel        chan *stat
 	responseReportingChannel       chan *pcapRespinfo
 	droppedRequestReportingChannel chan *reqinfo
@@ -36,7 +37,7 @@ type reporter struct  {
 
 
 	log                            *log.Logger
-	droppedLog		       *log.Logger
+	droppedLog                     *log.Logger
 }
 
 func NewReporter(expectResponses bool, statsLogPath string, droppedLogPath string) *reporter {
@@ -50,7 +51,8 @@ func NewReporter(expectResponses bool, statsLogPath string, droppedLogPath strin
 	rep.logDropped = droppedLogPath != ""
 
 	rep.initiatedChannel = make(chan bool, 1)
-	rep.doneChannel = make(chan bool, 1024)
+	rep.notifyFinishedChannel = make(chan bool, 1)
+	rep.requestToFinishChannel = make(chan bool, 1024)
 	rep.requestReportingChannel = make(chan *stat, 1024) // don't block proxys waiting to report stats
 	rep.responseReportingChannel = make(chan *pcapRespinfo, 1024)
 	rep.droppedRequestReportingChannel = make(chan *reqinfo, 1024)
@@ -119,8 +121,7 @@ func (this *reporter) AwaitInitialization() {
 //stats which have been submitted after calling Stop() may also be handled,
 //but there is no guarantee that this will happen and how many of them will be handled.
 func (this *reporter) Stop() {
-	this.doneChannel <- true
-	atomic.StoreInt32(&this.stopCalled, 1)
+	this.requestToFinishChannel <- true
 }
 
 //wait until all stats which were submitted before calling Stop() have been handled.
@@ -128,12 +129,9 @@ func (this *reporter) Stop() {
 //see Stop's docs.
 //calling this function before calling Stop() will result in no wait being performed,
 //instead an error being immediately returned
-func (this *reporter) SyncFlush() error {
-	if (atomic.LoadInt32(&this.stopCalled) == 1) {
-		<- this.doneChannel
-		return nil
-	} else  {
-		return errors.New("SyncFlush called before Stop")
+func (this *reporter) SyncFlush() {
+	if _, more := <- this.notifyFinishedChannel; !more {
+		//continue...
 	}
 }
 
@@ -203,77 +201,46 @@ func (this *reporter) Report () {
 
 	tensecs := time.Tick(time.Second * 10)
 
-	dropped := 0 //amount of dropped requests
 	lastStated := 0 //amount of recorded stats for which last calculation of rate was performed
-	numMismatchedRCs := 0 //amount of mismatched response codes received by responses during injecting
 
 	lastTime := time.Now() //last measured time by which we perform rate calculation
-	finishingUp := false
 	this.initiatedChannel <- true
+
+	glog.Info("Before select")
 	for {
 		select {
 		case someStat := <- this.requestReportingChannel:
-			if this.expectResponses && someStat != nil {
-				// do we have the other side?
-				key := streamKey{someStat.streamNum, someStat.reqNum}
-				if presp, is := streamRespSeqMap[key]; is {
-					delete(streamRespSeqMap, key)
-
-					presp.OrigRTT = float64(presp.Resptime-someStat.TS) / float64(time.Second)
-					someStat.pcapRespinfo = *presp
-					this.AddStat(someStat)
-					if someStat.OrigRC != someStat.RC {
-						numMismatchedRCs++
-					}
-				} else {
-					streamReqSeqMap[key] = someStat
-				}
-			} else {
-				this.AddStat(someStat)
-			}
+			this.handleRequestStat(someStat)
 
 		case someDrop := <- this.droppedRequestReportingChannel:
-			dropped++
-			if this.logDropped {
-				this.droppedLog.Println(someDrop.String())
-			}
+			this.handleDroppedStat(someDrop)
 
 		case somePcapResp := <- this.responseReportingChannel:
-		// do we have the other side?
-			if somePcapResp != nil {
-				key := streamKey{somePcapResp.respStreamNum, somePcapResp.respNum}
-				if reqstat, is := streamReqSeqMap[key]; is {
-					delete(streamReqSeqMap, key)
-					somePcapResp.OrigRTT = float64(somePcapResp.Resptime-reqstat.TS) / float64(time.Second)
-					reqstat.pcapRespinfo = *somePcapResp
-					this.AddStat(reqstat)
-					if reqstat.OrigRC != reqstat.RC {
-						numMismatchedRCs++
-					}
-				} else {
-					streamRespSeqMap[key] = somePcapResp
-				}
-			}
+			this.handleResponseStat(somePcapResp)
 
 		case <-this.failedRequestsReportingChannel:
 			this.addFailedStat()
+
 		case <-tensecs:
+
+			// calculate rate of handled requests/responses and update state counters (lastStated & lastTime)
+			// for the next calculation
 			diffStated := this.stated - lastStated
 			lastStated = this.stated
-
 			now := time.Now()
 			rate := float64(diffStated) / now.Sub(lastTime).Seconds()
 			lastTime = now
 
-			var repstate string
-			if finishingUp {
-				repstate = "Finishing Up"
-			} else {
-				repstate = "Still Running"
-			}
+			//var repstate string
+			//if finishingUp {
+			//	repstate = "Finishing Up"
+			//} else {
+			//	repstate = "Still Running"
+			//}
 
-			glog.Infof("%s: rate : %f  Reported : %d  Failed : %d.  Flawed : %d.  reqs : %d, proxySent : %d, sleeping : %d, inFlight : %d, lateDropped : %d\n",
-				repstate,
+			//glog.Infof("%s: rate : %f  Reported : %d  Failed : %d.  Flawed : %d.  reqs : %d, proxySent : %d, sleeping : %d, inFlight : %d, lateDropped : %d\n",
+			glog.Infof("rate : %f  Reported : %d  Failed : %d.  Flawed : %d.  reqs : %d, proxySent : %d, sleeping : %d, inFlight : %d, lateDropped : %d\n",
+				//repstate,
 				rate,
 				this.stated,
 				this.failed,
@@ -284,91 +251,175 @@ func (this *reporter) Report () {
 				atomic.LoadUint64(&numProxyInFlight),
 				atomic.LoadUint64(&numLateDropped))
 
-		case <-this.doneChannel:
-		// This is a little ugly, but we need to still process anything left in the statRepChan, but we can't
-		// pend on the chan:
-			finishingUp = true
+		case <-this.requestToFinishChannel:
+			glog.Info("Got done notification, emptying rest of data")
+			finishedEmptying := false
+			for !finishedEmptying {
+				select {
+				case someStat := <- this.requestReportingChannel:
+					this.handleRequestStat(someStat)
 
-		default:
-			if finishingUp {
-				glog.Infof("Done reporting.  Stated : %d  Failed : %d.  Flawed : %d.  Unmatched reqs: %d.  Unmatched resps: %d.  Pcap req errs : %d, Pcap resp errs : %d\n",
-					this.stated,
-					this.failed,
-					atomic.LoadUint64(&numBadStreams),
-					len(streamReqSeqMap),
-					len(streamRespSeqMap),
-					atomic.LoadUint64(&numPcapReqErrs),
-					atomic.LoadUint64(&numPcapRespErrs))
+				case someDrop := <- this.droppedRequestReportingChannel:
+					this.handleDroppedStat(someDrop)
 
-				if len(streamReqSeqMap) > 0 {
-					// Go through all unmatched reqs and log them without the responses:
-					for _, reqStat := range streamReqSeqMap {
-						this.AddStat(reqStat)
-					}
+				case somePcapResp := <- this.responseReportingChannel:
+					this.handleResponseStat(somePcapResp)
 
-					glog.Infof("Reported unmatched reqs.  Stated : %d  Failed : %d (sum : %d).\n",
-						this.stated,
-						this.failed,
-						this.stated+this.failed)
+				case <-this.failedRequestsReportingChannel:
+					this.addFailedStat()
+
+				default:
+					//exit
+					finishedEmptying = true
 				}
-
-				// Calculate average round trip time and standard deviation
-				// It seems recording a histogram would be better fit here, since we're dealing with latencies.
-				// Consider using go port of HdrHistogram? This would also save up on memory, since
-				// right now we are recording *every* rtt, while the histogram is fixed-size
-				var avg float64 = 0
-				var std float64 = 0
-				for _, rtt := range this.rtts {
-					avg += rtt
-				}
-				if nv := len(this.rtts); nv != 0 {
-					avg = avg / float64(nv)
-				}
-
-				for _, rtt := range this.rtts {
-					diff := avg - rtt
-					std += diff * diff
-				}
-				if nv := len(this.rtts); nv != 0 {
-					std = std / float64(nv)
-				}
-
-				numRespStated := this.stated - len(streamReqSeqMap)
-				// prevent DVZ
-				if numRespStated == 0 {
-					numRespStated = -1
-				}
-
-				smryString := fmt.Sprintf("Stated : %d  Failed : %d.  Flawed Streams: %d.  Mismatched RCs: %d (%3.3f%%).  Avg RTT %f sdev : %f.  Unmatched reqs: %d.  Unmatched resps : %d.  Flawed Reqs : %d.  Flawed Resps : %d.  Dropped : %d Pcap req errs : %d, Pcap resp errs : %d",
-					this.stated,
-					this.failed,
-					numBadStreams,
-					numMismatchedRCs,
-					100*float64(numMismatchedRCs)/float64(numRespStated),
-					avg,
-					std,
-					len(streamReqSeqMap),
-					len(streamRespSeqMap),
-					flawedReqStreams,
-					flawedRespStreams,
-					dropped,
-					atomic.LoadUint64(&numPcapReqErrs),
-					atomic.LoadUint64(&numPcapRespErrs))
-
-				glog.Infof("Summary : %s\n", smryString)
-
-				if this.logStats {
-					this.log.Printf("# Summary:\n")
-					this.log.Printf("# %s\n", smryString)
-				}
-
-				statfile.Close()
-
-				this.doneChannel <- true
-				return
 			}
+
+			glog.Info("After emptying rest of data, printing")
+			this.finish(statfile, droppedfile)
+			this.notifyFinishedChannel <- true
 		}
 	}
+}
+
+// returns whether the incoming stat had a mismatched return code
+func (this *reporter) handleRequestStat(someStat *stat) {
+	glog.Info("Received stat")
+
+	if this.expectResponses && someStat != nil {
+		// do we have the other side?
+		key := streamKey{someStat.streamNum, someStat.reqNum}
+		if presp, is := streamRespSeqMap[key]; is {
+			delete(streamRespSeqMap, key)
+
+			presp.OrigRTT = float64(presp.Resptime-someStat.TS) / float64(time.Second)
+			someStat.pcapRespinfo = *presp
+			this.AddStat(someStat)
+			if someStat.OrigRC != someStat.RC {
+				this.numMismatchedRCs++
+			}
+		} else {
+			streamReqSeqMap[key] = someStat
+		}
+	} else {
+		this.AddStat(someStat)
+	}
+}
+
+func (this *reporter) handleDroppedStat(req *reqinfo) {
+	glog.Info("Got dropped")
+	this.dropped++
+	if this.logDropped {
+		this.droppedLog.Println(req.String())
+	}
+}
+
+func (this *reporter) handleResponseStat(somePcapResp *pcapRespinfo) {
+	glog.Info("Got response")
+	// do we have the other side?
+	if somePcapResp != nil {
+		key := streamKey{somePcapResp.respStreamNum, somePcapResp.respNum}
+		if reqstat, is := streamReqSeqMap[key]; is {
+			delete(streamReqSeqMap, key)
+			somePcapResp.OrigRTT = float64(somePcapResp.Resptime-reqstat.TS) / float64(time.Second)
+			reqstat.pcapRespinfo = *somePcapResp
+			this.AddStat(reqstat)
+			if reqstat.OrigRC != reqstat.RC {
+				this.numMismatchedRCs++
+			}
+		} else {
+			streamRespSeqMap[key] = somePcapResp
+		}
+	}
+}
+
+func (this *reporter) finish(statFile *os.File, droppedFile *os.File) {
+	glog.Info("Finishing")
+	glog.Infof("Done reporting.  Stated : %d  Failed : %d.  Flawed : %d.  Unmatched reqs: %d.  Unmatched resps: %d.  Pcap req errs : %d, Pcap resp errs : %d\n",
+		this.stated,
+		this.failed,
+		atomic.LoadUint64(&numBadStreams),
+		len(streamReqSeqMap),
+		len(streamRespSeqMap),
+		atomic.LoadUint64(&numPcapReqErrs),
+		atomic.LoadUint64(&numPcapRespErrs))
+
+	if len(streamReqSeqMap) > 0 {
+		// Go through all unmatched reqs and log them without the responses:
+		for _, reqStat := range streamReqSeqMap {
+			this.AddStat(reqStat)
+		}
+
+		glog.Infof("Reported unmatched reqs.  Stated : %d  Failed : %d (sum : %d).\n",
+			this.stated,
+			this.failed,
+			this.stated+this.failed)
+	}
+
+	// Calculate average round trip time and standard deviation
+	// It seems recording a histogram would be better fit here, since we're dealing with latencies.
+	// Consider using go port of HdrHistogram? This would also save up on memory, since
+	// right now we are recording *every* rtt, while the histogram is fixed-size
+	avg, std := summarize(this.rtts)
+
+	numRespStated := this.stated - len(streamReqSeqMap)
+	// prevent DVZ
+	if numRespStated == 0 {
+		numRespStated = -1
+	}
+
+	smryString := fmt.Sprintf("Stated : %d  Failed : %d.  Flawed Streams: %d.  Mismatched RCs: %d (%3.3f%%).  Avg RTT %f sdev : %f.  Unmatched reqs: %d.  Unmatched resps : %d.  Flawed Reqs : %d.  Flawed Resps : %d.  Dropped : %d Pcap req errs : %d, Pcap resp errs : %d",
+		this.stated,
+		this.failed,
+		numBadStreams,
+		this.numMismatchedRCs,
+		100*float64(this.numMismatchedRCs)/float64(numRespStated),
+		avg,
+		std,
+		len(streamReqSeqMap),
+		len(streamRespSeqMap),
+		flawedReqStreams,
+		flawedRespStreams,
+		this.dropped,
+		atomic.LoadUint64(&numPcapReqErrs),
+		atomic.LoadUint64(&numPcapRespErrs))
+
+	glog.Infof("Summary : %s\n", smryString)
+
+	if this.logStats {
+		this.log.Printf("# Summary:\n")
+		this.log.Printf("# %s\n", smryString)
+	}
+
+	if (statFile != nil) {
+		statFile.Close()
+	}
+
+	if (droppedFile != nil) {
+		droppedFile.Close()
+	}
+
+	glog.Flush()
+	this.notifyFinishedChannel <- true
+}
+
+func summarize(nums []float64) (avg float64, std float64) {
+	length := len(nums)
+	if length == 0 {
+		return 0,0
+	}
+
+	for _, num := range nums {
+		avg += num
+	}
+	avg = avg / float64(length)
+
+	for _, num := range nums {
+		diff := avg - num
+		std += diff * diff
+	}
+	std = std / float64(length)
+
+	return
 }
 
 
