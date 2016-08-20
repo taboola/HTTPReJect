@@ -171,11 +171,6 @@ func (this *netKey) Reverse() *netKey {
 	return &netKey{this.net.Reverse(), this.transport.Reverse()}
 }
 
-// streamKey is a higher level mapping, mapping the stream number and sub req/resp to each other.
-type streamKey struct {
-	streamNum, streamSeq uint64
-}
-
 var pcapNetReqRespMap = make(map[netKey]uint64)
 type RunnerType int
 

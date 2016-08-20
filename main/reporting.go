@@ -61,11 +61,17 @@ func NewReporter(expectResponses bool, statsLogPath string, droppedLogPath strin
 	rep.responseReportingChannel = make(chan *pcapRespinfo, 1024)
 	rep.droppedRequestReportingChannel = make(chan *reqinfo, 1024)
 	rep.failedRequestsReportingChannel = make(chan bool, 1024)
+	rep.expectResponses = expectResponses
 
 	rep.streamReqSeqMap = make(map[streamKey]*stat)
 	rep.streamRespSeqMap = make(map[streamKey]*pcapRespinfo)
 	
 	return rep
+}
+
+// streamKey is a higher level mapping, mapping the stream number and sub req/resp to each other.
+type streamKey struct {
+	streamNum, streamSeq uint64
 }
 
 type stat struct {

@@ -63,7 +63,43 @@ var dropped5_file_path = base_dropped_file_path + "5.txt"
 var stats6_file_path = base_stats_file_path + "6.txt"
 var dropped6_file_path = base_dropped_file_path + "6.txt"
 
-func TestReporter_ReportManyRequests(t *testing.T) {
+var stats7_file_path = base_stats_file_path + "7.txt"
+var dropped7_file_path = base_dropped_file_path + "7.txt"
+
+func TestReportNilStat(t *testing.T) {
+	rep := NewReporter(false, "", "")
+	f := func(t *testing.T, rep *reporter) {
+		rep.ReportStat(nil)
+	}
+
+	testReporter(f, rep, t, func (r *reporter) (bool, string) {
+		return true, ""
+	})
+}
+
+func TestReportNilResponse(t *testing.T) {
+	rep := NewReporter(false, "", "")
+	f := func(t *testing.T, rep *reporter) {
+		rep.ReportResponse(nil)
+	}
+
+	testReporter(f, rep, t, func (r *reporter) (bool, string) {
+		return true, ""
+	})
+}
+
+func TestReportNilDropped(t *testing.T) {
+	rep := NewReporter(false, "", "")
+	f := func(t *testing.T, rep *reporter) {
+		rep.ReportDropped(nil)
+	}
+
+	testReporter(f, rep, t, func (r *reporter) (bool, string) {
+		return true, ""
+	})
+}
+
+func TestMismatchedRC(t *testing.T) {
 	info := &reqinfo{
 		URL: 		"\\test\\abc",
 		TS: 		time.Now().UnixNano(),
@@ -73,18 +109,55 @@ func TestReporter_ReportManyRequests(t *testing.T) {
 		reqNum: 	1,
 	}
 
+	resp := &pcapRespinfo{
+		Resptime:       info.TS + 200,
+		OrigRlen:      	1024,
+		OrigRC:      	500,
+		OrigRTT:       	0,
+		respStreamNum: 	5,
+		respNum:       	1,
+	}
 	stat := &stat{
 		reqinfo: 	*info,
-		pcapRespinfo: 	*new(pcapRespinfo),
 		RTT: 		510,
-		RC:		500,
+		RC:		404,
 		RespLen:	1024,
 		respMatch: 	make([]string, 0),
 	}
 
+	testFunc := func(t *testing.T, rep *reporter) {
+		rep.ReportStat(stat)
+		rep.ReportResponse(resp)
+	}
+
+	rep := NewReporter(true, stats7_file_path, dropped7_file_path)
+
+	pred := func (rep *reporter) (bool, string) {
+		result := rep.numMismatchedRCs == 1 && rep.stated == 1
+		return result, fmt.Sprintf("expected: mismatched = %v, got: %v, stated=%v, got: %v", 1, rep.numMismatchedRCs, 1, rep.stated)
+	}
+
+	testReporter(testFunc, rep, t, pred)
+}
+
+func TestReporter_ReportManyRequests(t *testing.T) {
+
 	repFunc := func(t *testing.T, rep *reporter) {
 		for i:=0; i<100;i++ {
-			rep.ReportStat(stat)
+			tStat := &stat {
+				reqinfo: reqinfo {
+					URL: "\\test\\abc",
+					TS: time.Now().UnixNano() + int64(i),
+					ReqLen: 1024,
+					TimeAccuracy: 15,
+					streamNum: 5 + uint64(i),
+					reqNum: uint64(i),
+				},
+				RTT: float64(i),
+				RC: 500,
+				RespLen: 1024,
+			}
+			rep.ReportStat(tStat)
 		}
 	}
 
@@ -98,8 +171,7 @@ func TestReporter_ReportManyRequests(t *testing.T) {
 			rep.failed == 0 &&
 			rep.dropped == 0 &&
 			len(rep.rtts) == 100 &&
-			rep.rtts[0] == 510 &&
-			strings.Contains(s, stat.String())
+			len(rep.streamReqSeqMap) == 100
 		},
 	}
 
@@ -118,7 +190,6 @@ func TestReporter_ReportRequestNoResponse(t *testing.T) {
 
 	stat := &stat{
 		reqinfo: 	*info,
-		pcapRespinfo: 	*new(pcapRespinfo),
 		RTT: 		510,
 		RC:		500,
 		RespLen:	1024,
@@ -140,7 +211,8 @@ func TestReporter_ReportRequestNoResponse(t *testing.T) {
 			rep.dropped == 0 &&
 			len(rep.rtts) == 1 &&
 			rep.rtts[0] == 510 &&
-			strings.Contains(s, stat.String())
+			strings.Contains(s, stat.String()) &&
+			len(rep.streamReqSeqMap) == 1
 		},
 	}
 
@@ -167,7 +239,6 @@ func TestReporter_ReportRequestBeforeResponse(t *testing.T) {
 	}
 	stat := &stat{
 		reqinfo: 	*info,
-		pcapRespinfo: 	*new(pcapRespinfo),
 		RTT: 		510,
 		RC:		500,
 		RespLen:	1024,
