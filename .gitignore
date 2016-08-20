@@ -23,4 +23,4 @@ HTTPReJect
 *.exe
 *.test
 *.prof
-testdata\out\*
+/main/testdata/out/*
